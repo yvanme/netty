@@ -20,10 +20,6 @@ import org.junit.Test;
 
 import io.netty.util.concurrent.AbstractEventExecutor.LazyRunnable;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-
 import java.util.Collections;
 import java.util.Set;
 import java.util.concurrent.Callable;
@@ -31,9 +27,15 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executor;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+
+import static org.hamcrest.CoreMatchers.*;
+import static org.junit.Assert.*;
 
 public class SingleThreadEventExecutorTest {
 
@@ -248,5 +250,169 @@ public class SingleThreadEventExecutorTest {
         assertTrue(latch3.await(100, TimeUnit.MILLISECONDS));
         assertEquals(0, latch1.getCount());
         assertEquals(0, latch2.getCount());
+    }
+
+    @Test
+    public void testTaskAddedAfterShutdownNotAbandoned() throws Exception {
+
+        // A queue that doesn't support remove, so tasks once added cannot be rejected anymore
+        LinkedBlockingQueue<Runnable> taskQueue = new LinkedBlockingQueue<Runnable>() {
+            @Override
+            public boolean remove(Object o) {
+                throw new UnsupportedOperationException();
+            }
+        };
+
+        final Runnable dummyTask = new Runnable() {
+            @Override
+            public void run() {
+            }
+        };
+
+        final LinkedBlockingQueue<Future<?>> submittedTasks = new LinkedBlockingQueue<Future<?>>();
+        final AtomicInteger attempts = new AtomicInteger();
+        final AtomicInteger rejects = new AtomicInteger();
+
+        ExecutorService executorService = Executors.newSingleThreadExecutor();
+        final SingleThreadEventExecutor executor = new SingleThreadEventExecutor(null, executorService, false,
+                taskQueue, RejectedExecutionHandlers.reject()) {
+            @Override
+            protected void run() {
+                while (!confirmShutdown()) {
+                    Runnable task = takeTask();
+                    if (task != null) {
+                        task.run();
+                    }
+                }
+            }
+
+            @Override
+            protected boolean confirmShutdown() {
+                boolean result = super.confirmShutdown();
+                // After shutdown is confirmed, scheduled one more task and record it
+                if (result) {
+                    attempts.incrementAndGet();
+                    try {
+                        submittedTasks.add(submit(dummyTask));
+                    } catch (RejectedExecutionException e) {
+                        // ignore, tasks are either accepted or rejected
+                        rejects.incrementAndGet();
+                    }
+                }
+                return result;
+            }
+        };
+
+        // Start the loop
+        executor.submit(dummyTask).sync();
+
+        // Shutdown without any quiet period
+        executor.shutdownGracefully(0, 100, TimeUnit.MILLISECONDS).sync();
+
+        // Ensure there are no user-tasks left.
+        assertEquals(0, executor.drainTasks());
+
+        // Verify that queue is empty and all attempts either succeeded or were rejected
+        assertTrue(taskQueue.isEmpty());
+        assertTrue(attempts.get() > 0);
+        assertEquals(attempts.get(), submittedTasks.size() + rejects.get());
+        for (Future<?> f : submittedTasks) {
+            assertTrue(f.isSuccess());
+        }
+    }
+
+    @Test(timeout = 5000)
+    public void testTakeTask() throws Exception {
+        final SingleThreadEventExecutor executor =
+                new SingleThreadEventExecutor(null, Executors.defaultThreadFactory(), true) {
+            @Override
+            protected void run() {
+                while (!confirmShutdown()) {
+                    Runnable task = takeTask();
+                    if (task != null) {
+                        task.run();
+                    }
+                }
+            }
+        };
+
+        //add task
+        TestRunnable beforeTask = new TestRunnable();
+        executor.execute(beforeTask);
+
+        //add scheduled task
+        TestRunnable scheduledTask = new TestRunnable();
+        ScheduledFuture<?> f = executor.schedule(scheduledTask , 1500, TimeUnit.MILLISECONDS);
+
+        //add task
+        TestRunnable afterTask = new TestRunnable();
+        executor.execute(afterTask);
+
+        f.sync();
+
+        assertThat(beforeTask.ran.get(), is(true));
+        assertThat(scheduledTask.ran.get(), is(true));
+        assertThat(afterTask.ran.get(), is(true));
+    }
+
+    @Test(timeout = 5000)
+    public void testTakeTaskAlwaysHasTask() throws Exception {
+        //for https://github.com/netty/netty/issues/1614
+
+        final SingleThreadEventExecutor executor =
+                new SingleThreadEventExecutor(null, Executors.defaultThreadFactory(), true) {
+            @Override
+            protected void run() {
+                while (!confirmShutdown()) {
+                    Runnable task = takeTask();
+                    if (task != null) {
+                        task.run();
+                    }
+                }
+            }
+        };
+
+        //add scheduled task
+        TestRunnable t = new TestRunnable();
+        ScheduledFuture<?> f = executor.schedule(t, 1500, TimeUnit.MILLISECONDS);
+
+        final Runnable doNothing = new Runnable() {
+            @Override
+            public void run() {
+                //NOOP
+            }
+        };
+        final AtomicBoolean stop = new AtomicBoolean(false);
+
+        //ensure always has at least one task in taskQueue
+        //check if scheduled tasks are triggered
+        try {
+            new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    while (!stop.get()) {
+                        executor.execute(doNothing);
+                    }
+                }
+            }).start();
+
+            f.sync();
+
+            assertThat(t.ran.get(), is(true));
+        } finally {
+            stop.set(true);
+        }
+    }
+
+    private static final class TestRunnable implements Runnable {
+        final AtomicBoolean ran = new AtomicBoolean();
+
+        TestRunnable() {
+        }
+
+        @Override
+        public void run() {
+            ran.set(true);
+        }
     }
 }

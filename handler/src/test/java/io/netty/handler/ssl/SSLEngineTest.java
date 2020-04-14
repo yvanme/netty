@@ -2978,7 +2978,12 @@ public abstract class SSLEngineTest {
             assertTrue(serverSession.getPacketBufferSize() > 0);
 
             assertNotNull(clientSession.getSessionContext());
-            assertNotNull(serverSession.getSessionContext());
+
+            // Workaround for JDK 14 regression.
+            // See https://bugs.openjdk.java.net/browse/JDK-8242008
+            if (PlatformDependent.javaVersion() < 14) {
+                assertNotNull(serverSession.getSessionContext());
+            }
 
             Object value = new Object();
 
